@@ -714,7 +714,7 @@ def test_flydsl_fmha_softmax_scale():
     batch, seq_len, num_heads, head_dim = 2, 2048, 8, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
     scale_value = 0.05
-    scale = torch.tensor(scale_value, device="cuda")
+    scale = torch.tensor(scale_value)
     out = flydsl_flash_attn_func(q, k, v, causal=False, softmax_scale=scale)
     ref = F.scaled_dot_product_attention(
         q.transpose(1, 2).contiguous(),
@@ -732,8 +732,10 @@ def test_flydsl_fmha_softmax_scale():
     assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
 
     with pytest.raises(ValueError, match="softmax_scale must be a scalar"):
+        flydsl_flash_attn_func(q, k, v, causal=False, softmax_scale=torch.ones(2))
+    with pytest.raises(ValueError, match="tensor softmax_scale must be on CPU"):
         flydsl_flash_attn_func(
-            q, k, v, causal=False, softmax_scale=torch.ones(2, device="cuda")
+            q, k, v, causal=False, softmax_scale=torch.tensor(0.05, device="cuda")
         )
 
 

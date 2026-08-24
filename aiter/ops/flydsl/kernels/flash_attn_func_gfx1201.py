@@ -629,7 +629,10 @@ def build_flash_attn_func_module(
 
             # ---- Opt4: Issue NEXT iteration's V global load ----
             next_kv_start = kv_block_start + fx.Int64(BLOCK_N_OUT)
-            _v_vecs_next = coop_load_v_global(next_kv_start)
+            safe_next_kv_start = (next_kv_start < kv_upper).select(
+                next_kv_start, fx.Int64(0)
+            )
+            _v_vecs_next = coop_load_v_global(safe_next_kv_start)
 
             _yield_args = [m_running, l_running] + o_accs
             for batch in range_constexpr(NUM_BATCHES_KV):

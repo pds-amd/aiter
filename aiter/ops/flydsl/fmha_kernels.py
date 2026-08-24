@@ -499,6 +499,11 @@ def flydsl_flash_attn_func(
 
     batch, seq_q_real, num_heads, head_dim = q.shape
     seq_kv_real = k.shape[1]
+    if batch == 0 or seq_q_real == 0 or seq_kv_real == 0 or num_heads == 0:
+        raise ValueError(
+            "batch, sequence lengths, and num_heads must be non-zero, got "
+            f"q={tuple(q.shape)} k={tuple(k.shape)}"
+        )
     is_cross = seq_kv_real != seq_q_real
     is_fp8 = q.dtype in _FP8_DTYPES
 
@@ -522,6 +527,11 @@ def flydsl_flash_attn_func(
                 raise ValueError(
                     "softmax_scale must be a scalar, "
                     f"got shape {tuple(softmax_scale.shape)}"
+                )
+            if softmax_scale.device.type != "cpu":
+                raise ValueError(
+                    "tensor softmax_scale must be on CPU to avoid a device "
+                    "synchronization; pass a Python float for hot paths"
                 )
             softmax_scale = softmax_scale.item()
         try:
