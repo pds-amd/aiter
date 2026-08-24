@@ -39,7 +39,6 @@ Requires: head_dim % 32 == 0, head_dim >= 64.
 """
 
 import math as host_math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -195,8 +194,9 @@ def build_flash_attn_func_module(
     K_STRIDE_I32 = K_STRIDE // 4  # K in i32 units (4 fp8 per i32)
     V_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts
 
-    ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
-    VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
+    # The FP8 packing and transposed LDS layout require one 16-byte vector per
+    # lane. The BF16 kernel's vec8 diagnostic toggle does not apply here.
+    VEC_WIDTH = 16
     THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
     ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
 

@@ -623,6 +623,25 @@ def test_flydsl_fp8_quant_non_current_stream():
     assert cos.mean().item() > 0.99
 
 
+def test_flydsl_fp8_ignores_bf16_lds_vec_width_toggle(monkeypatch):
+    """The BF16 vec8 diagnostic toggle must not alter FP8's fixed vec16 layout."""
+    from aiter.ops.flydsl import fmha_kernels
+
+    monkeypatch.setenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "0")
+    fmha_kernels._get_fp8_kernel.cache_clear()
+
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
+    out = flydsl_flash_attn_func(
+        qq, kk, vv, causal=False, q_descale=sq, k_descale=sk, v_descale=sv
+    )
+    ref = _ref_sdpa_bshd(q, k, v)
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cos.mean().item() > 0.998
+
+
 def test_flydsl_fmha_missing_fp8_descale_raises():
     """FP8 inputs without descales must raise (they are required)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
