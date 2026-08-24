@@ -603,6 +603,12 @@ def test_flydsl_fp8_quant_fp16_fallback_and_direct_guard():
         flydsl_fp8_pertensor_quant(q, rotate=False)
 
 
+def test_flydsl_fp8_quant_rejects_unknown_backend():
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    with pytest.raises(ValueError, match="unsupported fp8 quant backend"):
+        flydsl_fp8_quant(q, k, v, backend="flydls")
+
+
 def test_flydsl_fmha_missing_fp8_descale_raises():
     """FP8 inputs without descales must raise (they are required)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)

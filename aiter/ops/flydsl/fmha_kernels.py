@@ -231,6 +231,11 @@ def flydsl_fp8_quant(
     head_dim = q.shape[-1]
     same_size = q.numel() == k.numel() == v.numel()
     be = backend.lower()
+    if be not in {"flydsl", "triton", "torch"}:
+        raise ValueError(
+            f"unsupported fp8 quant backend {backend!r}; "
+            "expected one of: 'flydsl', 'triton', 'torch'"
+        )
 
     # Fully-FlyDSL per-tensor path (no Triton). Each tensor is quantized by its
     # own independent launch, so q/k/v need not be the same size (cross-attention
