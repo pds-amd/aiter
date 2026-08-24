@@ -402,55 +402,10 @@ def build_flash_attn_func_module(
             )
             return _pointer_load(vec_type, gep)
 
-        def _bitcast_i32(value):
-            return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
-
-        def _pack_bf16_pair(lo, hi, shift, mask):
-            lo_i32 = _bitcast_i32(lo)
-            hi_i32 = _bitcast_i32(hi)
-            return (hi_i32 & mask) | lo_i32.shrui(shift)
-
-        def bf16_trunc_pack_v8(f32_vals):
-            """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits)."""
-            _c16 = fx.Int32(16)
-            _cmask = fx.Int32(0xFFFF0000)
-            pairs = []
-            for j in range_constexpr(4):
-                pairs.append(
-                    _pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
-                )
-            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
-
         def k_buf_base(buf_id):
             if const_expr(isinstance(buf_id, int)):
                 return fx.Index(buf_id * LDS_K_TILE_SIZE)
             return buf_id * fx.Index(LDS_K_TILE_SIZE)
-
-        def _vec16f16_to_4xi32_fp8(vec):
-            # Convert v16f16/v16bf16 → 16 fp8 packed as 4 i32 (4 fp8/i32).
-            # cvt_pk_fp8_f32(i32, f32_a, f32_b, seed, word_sel=0|1):
-            #   word_sel=0 → fills bytes [0:1], word_sel=1 → fills bytes [2:3].
-            # Two calls per i32 to fill all 4 bytes.
-            _i32ty = ir.IntegerType.get_signless(32)
-            _c_zero_i32 = arith.constant(0, type=_i32ty)
-            elems_f32 = []
-            for idx in range_constexpr(VEC_WIDTH):
-                e = _raw(Vec(vec)[idx])
-                elems_f32.append(
-                    arith.extf(T.f32, e, fastmath=arith.FastMathFlags.fast)
-                )
-            # Pack into 4 i32 words (VEC_WIDTH=16 fp8 / 4 fp8 per i32 = 4 i32)
-            result = []
-            for wi in range_constexpr(4):
-                base = wi * 4
-                pk = rocdl.cvt_pk_fp8_f32(
-                    _i32ty, elems_f32[base + 0], elems_f32[base + 1], _c_zero_i32, 0
-                )
-                pk = rocdl.cvt_pk_fp8_f32(
-                    _i32ty, elems_f32[base + 2], elems_f32[base + 3], pk, 1
-                )
-                result.append(pk)
-            return result
 
         def coop_load_k(tile_start, buf_id=0):
             # Load K global (already fp8), store as i32 words in lds_k_i32.
@@ -542,26 +497,6 @@ def build_flash_attn_func_module(
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
-
-        def _v8f16_to_fp8_v2i32(vec):
-            # v8f16/v8bf16 → [i32_lo, i32_hi] where each i32 = 4 packed fp8 bytes.
-            _i32ty = ir.IntegerType.get_signless(32)
-            _c_zero_i32 = arith.constant(0, type=_i32ty)
-            elems_f32 = []
-            for idx in range_constexpr(8):
-                e = _raw(Vec(vec)[idx])
-                elems_f32.append(
-                    arith.extf(T.f32, e, fastmath=arith.FastMathFlags.fast)
-                )
-            pk0 = rocdl.cvt_pk_fp8_f32(
-                _i32ty, elems_f32[0], elems_f32[1], _c_zero_i32, 0
-            )
-            pk0 = rocdl.cvt_pk_fp8_f32(_i32ty, elems_f32[2], elems_f32[3], pk0, 1)
-            pk1 = rocdl.cvt_pk_fp8_f32(
-                _i32ty, elems_f32[4], elems_f32[5], _c_zero_i32, 0
-            )
-            pk1 = rocdl.cvt_pk_fp8_f32(_i32ty, elems_f32[6], elems_f32[7], pk1, 1)
-            return [pk0, pk1]
 
         c_zero_v2i32_vec = Vec.filled(2, 0, fx.Int32).ir_value()
         q_b_packs = []
@@ -725,7 +660,7 @@ def build_flash_attn_func_module(
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec)
 
-            # Store V to LDS (row-major, fast vector store)
+            # Store V transposed as V_T[d][kv_row] for contiguous GEMM2 loads.
             coop_store_v_lds(_v_vecs_prefetch, 0)
             gpu.barrier()
 

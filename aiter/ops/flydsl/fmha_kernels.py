@@ -436,8 +436,8 @@ def flydsl_flash_attn_func(
 ) -> torch.Tensor:
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
 
-    Supports bf16/f16 self- and cross-attention, and a per-tensor fp8 self-attn
-    fast path. Tiles are chosen from the shape; seq_len is padded internally.
+    Supports bf16/f16 and per-tensor fp8 self- and cross-attention. Tiles are
+    chosen from the shape; sequence lengths are padded internally.
 
     Args:
         q: ``[batch, seqlen_q, num_heads, head_dim]`` (BSHD).
