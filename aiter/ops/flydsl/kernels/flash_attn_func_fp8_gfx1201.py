@@ -218,9 +218,9 @@ def build_flash_attn_func_module(
     V_BYTE_BASE = LDS_K_TOTAL_SIZE  # fp8 V region starts after fp8 K region (bytes)
 
     # PERF(gfx1201): Keep typed SmemPtr views and their required fx.Index
-    # boundaries. FlyDSL 0.2.4's SharedAllocator byte-pointer lowering makes
-    # representative FP8 attention shapes 3.7-5.1x slower. Revisit only when
-    # the generated ISA and latency are equivalent.
+    # boundaries. FlyDSL 0.2.4 and 0.3.1 SharedAllocator byte-pointer lowering
+    # makes representative FP8 attention shapes 3.7-5.1x slower. Revisit only
+    # when the generated ISA and latency are equivalent.
     allocator = SmemAllocator(
         None,
         arch=gpu_arch,

@@ -202,9 +202,9 @@ def build_flash_attn_func_module(
     }
     elem_numeric_cls = _NUMERIC_MAP[dtype_str]
 
-    # PERF(gfx1201): FlyDSL 0.2.4 lowers the SharedAllocator pointer path more
-    # than 2x slower than this typed memref path on representative attention
-    # shapes. Keep this exception until the generated ISA is equivalent.
+    # PERF(gfx1201): FlyDSL 0.2.4 and 0.3.1 lower the SharedAllocator pointer
+    # path more than 2x slower than this typed memref path on representative
+    # attention shapes. Keep this exception until generated ISA is equivalent.
     allocator = SmemAllocator(
         None, arch=gpu_arch, global_sym_name="flash_attn_func_gfx1201_smem"
     )
