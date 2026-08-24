@@ -508,6 +508,20 @@ def flydsl_flash_attn_func(
         raise ValueError(
             f"kernel requires head_dim >= 64 and head_dim % 32 == 0, got {head_dim}"
         )
+    if softmax_scale is not None:
+        if torch.is_tensor(softmax_scale):
+            if softmax_scale.numel() != 1:
+                raise ValueError(
+                    "softmax_scale must be a scalar, "
+                    f"got shape {tuple(softmax_scale.shape)}"
+                )
+            softmax_scale = softmax_scale.item()
+        try:
+            softmax_scale = float(softmax_scale)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"softmax_scale must be convertible to float, got {softmax_scale!r}"
+            ) from exc
 
     block_m, block_n = _pick_tiles(seq_q_real, head_dim)
 

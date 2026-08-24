@@ -684,17 +684,18 @@ def test_flydsl_fmha_missing_fp8_descale_raises():
 
 
 def test_flydsl_fmha_softmax_scale():
-    """Custom softmax_scale must match SDPA with the same scale."""
+    """A scalar-tensor softmax_scale is normalized and matches SDPA."""
     batch, seq_len, num_heads, head_dim = 2, 2048, 8, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    scale = 0.05
+    scale_value = 0.05
+    scale = torch.tensor(scale_value, device="cuda")
     out = flydsl_flash_attn_func(q, k, v, causal=False, softmax_scale=scale)
     ref = F.scaled_dot_product_attention(
         q.transpose(1, 2).contiguous(),
         k.transpose(1, 2).contiguous(),
         v.transpose(1, 2).contiguous(),
         is_causal=False,
-        scale=scale,
+        scale=scale_value,
     ).transpose(1, 2)
 
     cos = F.cosine_similarity(
@@ -703,6 +704,11 @@ def test_flydsl_fmha_softmax_scale():
         dim=1,
     )
     assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+
+    with pytest.raises(ValueError, match="softmax_scale must be a scalar"):
+        flydsl_flash_attn_func(
+            q, k, v, causal=False, softmax_scale=torch.ones(2, device="cuda")
+        )
 
 
 def test_flydsl_fmha_out_buffer():
