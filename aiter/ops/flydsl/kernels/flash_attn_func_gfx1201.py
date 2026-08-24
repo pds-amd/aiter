@@ -3,7 +3,7 @@
 
 """Combined Flash Attention kernel for gfx1201 with optimizations:
 
-1. BLOCK_N=32 (reduced tile, fewer iterations, better occupancy).
+1. Shape-selected BLOCK_M/BLOCK_N tiles balance KV-loop work and occupancy.
 2. rocdl.exp2 (native ISA exp2 intrinsic, bypasses arith lowering).
 3. Software-pipelined GEMM2: preload next V pack while current WMMA executes,
    hiding LDS read latency behind matrix compute.

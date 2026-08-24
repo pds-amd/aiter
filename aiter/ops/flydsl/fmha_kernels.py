@@ -222,10 +222,11 @@ def flydsl_fp8_quant(
 
     ``backend`` selects the producer: ``"flydsl"`` (default) runs the fully-FlyDSL
     2-pass rotate+quant kernels (in-register FWHT, no Triton); ``"triton"`` runs
-    the fused Triton passes; ``"torch"`` runs the reference. All three keep rotated
-    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires bf16 inputs,
-    gfx1201, and head_dim==128 (per-tensor, so q/k/v may differ in size, e.g.
-    cross-attention); it silently falls back to Triton/torch otherwise. The
+    the fused Triton passes; ``"torch"`` runs the reference and materializes its
+    rotated Q/K tensors. The FlyDSL and Triton paths recompute the rotation and
+    keep rotated Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires bf16
+    inputs, gfx1201, and head_dim==128 (per-tensor, so q/k/v may differ in size,
+    e.g. cross-attention); it silently falls back to Triton/torch otherwise. The
     Triton fused path additionally requires same-size q/k/v.
     """
     head_dim = q.shape[-1]

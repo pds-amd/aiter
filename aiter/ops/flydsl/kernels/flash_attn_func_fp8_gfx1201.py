@@ -11,7 +11,7 @@ scale; v_scale folds into the 1/l normalizer.
 
 Performance-relevant choices:
 
-1. BLOCK_N=32: fewer KV iterations and better occupancy than wider tiles.
+1. Shape-selected BLOCK_M/BLOCK_N tiles balance KV-loop work and occupancy.
 2. rocdl.exp2: native ISA exp2 intrinsic, bypasses arith lowering.
 3. Software-pipelined GEMM2: preload the next V pack while the current WMMA
    runs, hiding LDS read latency behind matrix compute.
