@@ -241,7 +241,10 @@ def flydsl_fp8_pertensor_quant(
     # pass 1: per-row amax partials (x_out unused -> pass x_in as a valid ptr).
     amax_k = _compile(head_dim=D, rotate=rotate, mode="amax")
     _run_compiled(amax_k, _ptr(x), _ptr(x), _ptr(partials), M, fx_stream)
-    scale = (partials.amax() / _FP8_MAX).clamp(min=1e-12).reshape(1)
+    # Keep the intermediate reduction ordered after pass 1 and before pass 2
+    # when the caller supplies a stream other than PyTorch's current stream.
+    with torch.cuda.stream(stream):
+        scale = (partials.amax() / _FP8_MAX).clamp(min=1e-12).reshape(1)
 
     # pass 2: scale/clamp/cast to fp8 using the single global descale.
     scale_k = _compile(head_dim=D, rotate=rotate, mode="scale")

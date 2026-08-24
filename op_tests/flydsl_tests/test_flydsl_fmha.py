@@ -609,6 +609,20 @@ def test_flydsl_fp8_quant_rejects_unknown_backend():
         flydsl_fp8_quant(q, k, v, backend="flydls")
 
 
+def test_flydsl_fp8_quant_non_current_stream():
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    x = torch.randn(1024, 128, dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    xq, scale = flydsl_fp8_pertensor_quant(x, rotate=False, stream=stream)
+    stream.synchronize()
+
+    cos = F.cosine_similarity(x.float(), xq.float() * scale, dim=1)
+    assert cos.mean().item() > 0.99
+
+
 def test_flydsl_fmha_missing_fp8_descale_raises():
     """FP8 inputs without descales must raise (they are required)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
