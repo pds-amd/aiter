@@ -232,8 +232,10 @@ def flydsl_fp8_quant(
     rotated Q/K tensors. The FlyDSL and Triton paths recompute the rotation and
     keep rotated Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires bf16
     inputs, gfx1201, and head_dim==128 (per-tensor, so q/k/v may differ in size,
-    e.g. cross-attention); it silently falls back to Triton/torch otherwise. The
-    Triton fused path additionally requires same-size q/k/v.
+    e.g. cross-attention); it silently falls back to Triton/torch otherwise. An
+    explicit ``"triton"`` request uses the fused path only when rotation is
+    enabled, a Hadamard matrix exists, and q/k/v have equal element counts; it
+    falls back to the Torch producer otherwise.
     """
     if not isinstance(backend, str):
         raise TypeError(f"backend must be a string, got {type(backend).__name__}")
@@ -283,7 +285,7 @@ def flydsl_fp8_quant(
         return q8, k8, v8, sq, sk, sv
 
     # Triton/torch fallbacks rotate with an explicit host-side Hadamard matrix.
-    R = _hadamard_matrix(head_dim, q.device, torch.bfloat16) if rotation else None
+    R = _hadamard_matrix(head_dim, q.device, q.dtype) if rotation else None
     if be == "torch" or not (_HAS_TRITON and R is not None and same_size):
         q8, sq = _quant_one_pertensor(q, R)
         k8, sk = _quant_one_pertensor(k, R)

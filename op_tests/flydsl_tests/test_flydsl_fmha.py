@@ -604,6 +604,22 @@ def test_flydsl_fp8_quant_fp16_fallback_and_direct_guard():
         flydsl_fp8_pertensor_quant(q, rotate=False)
 
 
+def test_flydsl_fp8_quant_fp16_rotation_uses_fp16_matrix(monkeypatch):
+    from aiter.ops.flydsl import fmha_kernels
+
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.float16)
+    seen_dtypes = []
+    original = fmha_kernels._hadamard_matrix
+
+    def _record_dtype(head_dim, device, dtype):
+        seen_dtypes.append(dtype)
+        return original(head_dim, device, dtype)
+
+    monkeypatch.setattr(fmha_kernels, "_hadamard_matrix", _record_dtype)
+    flydsl_fp8_quant(q, k, v, rotation=True, backend="torch")
+    assert seen_dtypes == [torch.float16]
+
+
 def test_flydsl_fp8_quant_rejects_unknown_backend():
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="unsupported fp8 quant backend"):
