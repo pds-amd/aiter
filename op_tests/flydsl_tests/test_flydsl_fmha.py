@@ -111,6 +111,7 @@ def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
     [
         (1, 1024, 512, 12, 128),  # Wan-style long Q, short text K/V.
         (1, 4096, 512, 12, 128),
+        (1, 2048, 1400, 8, 128),  # K/V pad to BN=64 (1408), not BM=256 (1536).
         (1, 2048, 500, 8, 64),  # unaligned K/V (500 % BLOCK_N != 0 -> tail mask).
     ],
 )

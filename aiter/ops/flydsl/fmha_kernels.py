@@ -555,7 +555,14 @@ def flydsl_flash_attn_func(
     tail_mask = (not causal) and (kv_len_for_mask % block_n != 0)
 
     seq_q_pad = ((seq_q_real + block_m - 1) // block_m) * block_m
-    seq_kv_pad = ((seq_kv_real + block_m - 1) // block_m) * block_m
+    # Self-attention aliases the kernel's KV length/stride to the padded Q
+    # length. Cross-attention tracks KV independently and only needs a complete
+    # BLOCK_N tile for the final cooperative load.
+    seq_kv_pad = (
+        seq_q_pad
+        if not is_cross
+        else ((seq_kv_real + block_n - 1) // block_n) * block_n
+    )
 
     q_p = _pad_seq(q, seq_q_pad - seq_q_real)
     k_p = _pad_seq(k, seq_kv_pad - seq_kv_real)

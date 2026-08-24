@@ -37,10 +37,12 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-torch.set_default_device("cuda")
-
 # The flydsl flash-attn kernels are gfx1201/RDNA4 only.
 SUPPORTED_GFX = ["gfx1201"]
+
+if torch.cuda.is_available():
+    # PyTorch exposes ROCm devices through its torch.cuda compatibility API.
+    torch.set_default_device("cuda")
 
 # (label, batch, seq_len, num_heads, head_dim) -- production diffusion shapes.
 SHAPES = [
@@ -172,6 +174,10 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
         ret[f"{name}_transient_mb"] = peak_mb - base_mb
         ret[f"{name}_err"] = err
     return ret
+
+
+# This is a CLI benchmark helper, not a pytest test with injectable fixtures.
+test_flydsl_fmha.__test__ = False
 
 
 def main():
