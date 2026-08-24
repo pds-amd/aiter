@@ -39,10 +39,15 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import rocdl
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import Stream, T
+
+try:
+    from flydsl.expr import buffer_ops
+except ImportError:
+    from . import buffer_ops
 
 from .tensor_shim import _run_compiled, _to_raw
 

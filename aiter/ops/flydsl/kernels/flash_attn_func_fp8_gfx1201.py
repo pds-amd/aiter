@@ -53,7 +53,6 @@ from flydsl._mlir.dialects import (
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
@@ -66,6 +65,11 @@ from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+try:
+    from flydsl.expr import buffer_ops
+except ImportError:
+    from aiter.ops.flydsl.kernels import buffer_ops
 
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled
