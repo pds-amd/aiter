@@ -582,6 +582,27 @@ def test_flydsl_fp8_quant_backend_agreement():
     ), f"flydsl-vs-torch mean_cos={cos_fb.mean().item():.6f}"
 
 
+def test_flydsl_fp8_quant_fp16_fallback_and_direct_guard():
+    """FP16 must use a safe public fallback and fail fast at the bf16-only
+    low-level FlyDSL producer instead of being reinterpreted as bf16 bits."""
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.float16)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False, backend="flydsl")
+    for original, quantized, scale in zip((q, k, v), (qq, kk, vv), (sq, sk, sv)):
+        cos = F.cosine_similarity(
+            original.float().reshape(-1, 128),
+            (quantized.float() * scale).reshape(-1, 128),
+            dim=1,
+        )
+        assert cos.mean().item() > 0.99
+
+    with pytest.raises(TypeError, match="requires bfloat16 input"):
+        flydsl_fp8_pertensor_quant(q, rotate=False)
+
+
 def test_flydsl_fmha_missing_fp8_descale_raises():
     """FP8 inputs without descales must raise (they are required)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)

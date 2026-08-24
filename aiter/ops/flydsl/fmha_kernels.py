@@ -223,10 +223,10 @@ def flydsl_fp8_quant(
     ``backend`` selects the producer: ``"flydsl"`` (default) runs the fully-FlyDSL
     2-pass rotate+quant kernels (in-register FWHT, no Triton); ``"triton"`` runs
     the fused Triton passes; ``"torch"`` runs the reference. All three keep rotated
-    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires gfx1201 and
-    head_dim==128 (per-tensor, so q/k/v may differ in size, e.g. cross-attention);
-    it silently falls back to Triton/torch otherwise. The Triton fused path
-    additionally requires same-size q/k/v.
+    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires bf16 inputs,
+    gfx1201, and head_dim==128 (per-tensor, so q/k/v may differ in size, e.g.
+    cross-attention); it silently falls back to Triton/torch otherwise. The
+    Triton fused path additionally requires same-size q/k/v.
     """
     head_dim = q.shape[-1]
     same_size = q.numel() == k.numel() == v.numel()
@@ -234,9 +234,14 @@ def flydsl_fp8_quant(
 
     # Fully-FlyDSL per-tensor path (no Triton). Each tensor is quantized by its
     # own independent launch, so q/k/v need not be the same size (cross-attention
-    # is fine); only head_dim==128 (VEC=4) is required by the MVP kernel. Uses the
-    # in-register FWHT, so it needs no host-side Hadamard matrix.
-    if be == "flydsl" and head_dim == 128 and _live_gfx() == "gfx1201":
+    # is fine). The MVP kernel requires bf16 and head_dim==128 (VEC=4). It uses
+    # the in-register FWHT, so it needs no host-side Hadamard matrix.
+    flydsl_supported = (
+        q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and head_dim == 128
+        and _live_gfx() == "gfx1201"
+    )
+    if be == "flydsl" and flydsl_supported:
         q8, sq = _quant_pertensor_flydsl(q, rotate=rotation)
         k8, sk = _quant_pertensor_flydsl(k, rotate=rotation)
         v8, sv = _quant_pertensor_flydsl(v, rotate=False)

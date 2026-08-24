@@ -39,9 +39,9 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import rocdl
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, vector
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import Stream, T
 
 from .tensor_shim import _run_compiled, _to_raw
@@ -80,24 +80,20 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
 
         row = fx.block_idx.x  # one wave per row
         tid = fx.thread_idx.x  # 0..31 lane
-        row_idx = arith.index_cast(T.index, _to_raw(row))
+        row_idx = fx.Int64(row)
 
         # ---- load VEC bf16 for this lane: elems [row*D + tid*VEC, +VEC) ----
         in_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            arith.index_cast(T.i64, fx.ptrtoint(x_in))
+            fx.Int64(fx.ptrtoint(x_in)).ir_value()
         )
-        row_off_elems = row_idx * arith.constant(D, type=T.index) + arith.index_cast(
-            T.index, _to_raw(ArithValue(tid) * arith.constant(VEC, type=i32))
-        )
-        row_off_dw = arith.index_cast(
-            i32, arith.divui(row_off_elems, arith.constant(2, type=T.index))
-        )
+        row_off_elems = row_idx * D + fx.Int64(tid) * VEC
+        row_off_dw = fx.Int32(row_off_elems // 2)
         x_raw = buffer_ops.buffer_load(
             in_rsrc, row_off_dw, vec_width=VEC // 2, dtype=i32
         )
-        x_bf16 = vector.bitcast(T.vec(VEC, T.bf16), x_raw)
+        x_bf16 = fx.Vector(x_raw).bitcast(fx.BFloat16)
         xf = [
-            arith.extf(f32, _to_raw(vector.extract(x_bf16, [p])), fastmath=fm_fast)
+            arith.extf(f32, _to_raw(x_bf16[p]), fastmath=fm_fast)
             for p in range_constexpr(VEC)
         ]
 
@@ -115,7 +111,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
                             _to_raw(a), _to_raw(b), fastmath=fm_fast
                         )
                 xf = new
-            lane = ArithValue(tid)  # cross-lane stages
+            lane = tid
             for st in range_constexpr(LOG2D - LOG2VEC):
                 off = 1 << st  # lane xor offset
                 lane_and = arith.andi(_to_raw(lane), arith.constant(off, type=i32))
@@ -124,7 +120,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
                 )
                 new = []
                 for p in range_constexpr(VEC):
-                    peer = _to_raw(ArithValue(xf[p]).shuffle_xor(off, BLOCK_THREADS))
+                    peer = _to_raw(fx.Float32(xf[p]).shuffle_xor(off, BLOCK_THREADS))
                     lo = arith.addf(_to_raw(xf[p]), peer, fastmath=fm_fast)  # self+peer
                     hi = arith.subf(peer, _to_raw(xf[p]), fastmath=fm_fast)  # peer-self
                     new.append(arith.select(is_high, hi, lo))
@@ -140,18 +136,18 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
                 am = arith.maximumf(am, fmath.absf(_to_raw(xf[p + 1])))
             for st in range_constexpr(int(math.log2(BLOCK_THREADS))):
                 off = BLOCK_THREADS // (2 << st)
-                peer = _to_raw(ArithValue(am).shuffle_xor(off, BLOCK_THREADS))
+                peer = _to_raw(fx.Float32(am).shuffle_xor(off, BLOCK_THREADS))
                 am = arith.maximumf(am, peer)
             if tid == fx.Int32(0):
                 s_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                    arith.index_cast(T.i64, fx.ptrtoint(scale_io))
+                    fx.Int64(fx.ptrtoint(scale_io)).ir_value()
                 )
                 buffer_ops.buffer_store(am, s_rsrc, _to_raw(row), offset_is_bytes=False)
             return
 
         # mode == "scale": read the single global descale (all lanes broadcast).
         sc_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            arith.index_cast(T.i64, fx.ptrtoint(scale_io))
+            fx.Int64(fx.ptrtoint(scale_io)).ir_value()
         )
         scale = _to_raw(
             buffer_ops.buffer_load(
@@ -173,12 +169,10 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         pk = rocdl.cvt_pk_fp8_f32(i32, q[0], q[1], c0, 0)
         pk = rocdl.cvt_pk_fp8_f32(i32, q[2], q[3], pk, 1)
         out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            arith.index_cast(T.i64, fx.ptrtoint(x_out))
+            fx.Int64(fx.ptrtoint(x_out)).ir_value()
         )
         # fp8 out: 1 byte/elem, VEC=4 bytes = 1 dword. dword offset = row_off_elems/4
-        out_off_dw = arith.index_cast(
-            i32, arith.divui(row_off_elems, arith.constant(4, type=T.index))
-        )
+        out_off_dw = fx.Int32(row_off_elems // 4)
         buffer_ops.buffer_store(pk, out_rsrc, out_off_dw, offset_is_bytes=False)
 
     @flyc.jit
@@ -189,7 +183,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         M: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        idx_m = arith.index_cast(T.index, _to_raw(M))
+        idx_m = fx.Int64(M)
         k = kernel(x_in, x_out, scale_io)
         k.launch(grid=(idx_m, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -220,6 +214,11 @@ def flydsl_fp8_pertensor_quant(
     Returns ``(x_fp8, scale)`` where ``scale`` is a 1-element f32 tensor
     (``real = fp8 * scale``). head_dim==128 only; callers fall back otherwise.
     """
+    if x.dtype != torch.bfloat16:
+        raise TypeError(
+            "flydsl_fp8_pertensor_quant requires bfloat16 input, " f"got {x.dtype}"
+        )
+
     D = x.shape[-1]
     x = x.contiguous()
     M = x.numel() // D

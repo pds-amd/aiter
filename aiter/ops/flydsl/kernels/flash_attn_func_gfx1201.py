@@ -39,13 +39,15 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
+from flydsl._mlir.dialects import memref as _memref
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -68,7 +70,7 @@ def _llvm_ptr_ty():
 
 def _pointer_to_llvm_ptr(ptr) -> ir.Value:
     """Convert a FlyDSL pointer argument to the LLVM pointer used by raw loads."""
-    ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
+    ptr_i64 = fx.Int64(fx.ptrtoint(ptr)).ir_value()
     return _llvm.IntToPtrOp(_llvm_ptr_ty(), ptr_i64).result
 
 
@@ -97,6 +99,7 @@ def build_flash_attn_func_module(
     daz=True,
 ):
     """Build gfx1201 flash_attn_func (BN=32 + rocdl.exp2 + pipelined GEMM2 + overlapped V load)."""
+    gpu_arch = get_hip_arch()
 
     # ---- WMMA / wave32 constants ----
     WARP_SIZE = 32
@@ -199,9 +202,14 @@ def build_flash_attn_func_module(
     }
     elem_numeric_cls = _NUMERIC_MAP[dtype_str]
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[elem_numeric_cls, LDS_KV_TOTAL_SIZE, 16]
+    # PERF(gfx1201): FlyDSL 0.2.4 lowers the SharedAllocator pointer path more
+    # than 2x slower than this typed memref path on representative attention
+    # shapes. Keep this exception until the generated ISA is equivalent.
+    allocator = SmemAllocator(
+        None, arch=gpu_arch, global_sym_name="flash_attn_func_gfx1201_smem"
+    )
+    lds_kv_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_kv_offset + LDS_KV_TOTAL_SIZE * 2
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_func_kernel(
@@ -248,21 +256,25 @@ def build_flash_attn_func_module(
                 ).result
             return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
-        seq_len_v = fx.Index(seq_len)
-        seq_len_real_v = fx.Index(seq_len_real)
+        seq_len_v = fx.Int64(seq_len)
+        seq_len_real_v = fx.Int64(seq_len_real)
         if const_expr(CROSS_ATTN):
-            seq_len_kv_v = fx.Index(seq_len_kv)
+            seq_len_kv_v = fx.Int64(seq_len_kv)
         else:
             # Self-attn: K/V share Q's sequence length. Aliasing to seq_len_v (not
             # the seq_len_kv arg) leaves the addressing math unchanged, so the
             # self-attn path pays nothing for the cross-attn arg.
             seq_len_kv_v = seq_len_v
 
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        lds_kv = lds.kv.ptr
+        lds_kv = SmemPtr(
+            allocator.get_base(),
+            lds_kv_offset,
+            elem_type,
+            shape=(LDS_KV_TOTAL_SIZE,),
+        ).get()
 
-        block_id = fx.Index(gpu.block_idx.x)
-        tid = fx.Index(gpu.thread_idx.x)
+        block_id = fx.Int64(gpu.block_idx.x)
+        tid = fx.Int64(gpu.thread_idx.x)
 
         wave_id = tid // WARP_SIZE
         lane = tid % WARP_SIZE
@@ -312,7 +324,7 @@ def build_flash_attn_func_module(
             return _load_global_half_vec(base_ptr, base_idx, v8f16_type)
 
         def _bitcast_i32(value):
-            return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
+            return fx.Float32(value).bitcast(fx.Int32)
 
         def _pack_bf16_pair(lo, hi, shift, mask):
             lo_i32 = _bitcast_i32(lo)
@@ -332,11 +344,11 @@ def build_flash_attn_func_module(
 
         def k_buf_base(buf_id):
             if const_expr(isinstance(buf_id, int)):
-                return fx.Index(buf_id * LDS_K_TILE_SIZE)
-            return buf_id * fx.Index(LDS_K_TILE_SIZE)
+                return fx.Int64(buf_id * LDS_K_TILE_SIZE)
+            return buf_id * fx.Int64(LDS_K_TILE_SIZE)
 
         def v_buf_base(buf_id):
-            return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
+            return fx.Int64(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
 
         def coop_load_k(tile_start, buf_id=0):
             k_base = k_buf_base(buf_id)
@@ -344,23 +356,23 @@ def build_flash_attn_func_module(
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 row_idx = tile_start + load_row_in_batch + row_offset
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = load_row_in_batch < fx.Int64(BLOCK_N)
                     if row_valid:
                         g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_row = load_row_in_batch + row_offset
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = load_global_f16xN(k_ptr, g_idx)
-                        Vec(vec).store(lds_kv, [lds_idx])
+                        Vec(vec).store(lds_kv, [fx.Index(lds_idx)])
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
                     lds_row = load_row_in_batch + row_offset
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     vec = load_global_f16xN(k_ptr, g_idx)
-                    fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
+                    Vec(vec).store(lds_kv, [fx.Index(lds_idx)])
 
         def _v_store_row_major(v_base, lds_row, vec):
             lds_idx = v_base + lds_row * V_STRIDE + load_col_base
-            fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
+            Vec(vec).store(lds_kv, [fx.Index(lds_idx)])
 
         def coop_load_v_global(tile_start):
             vecs = []
@@ -371,7 +383,7 @@ def build_flash_attn_func_module(
                     # threads would read past the tile and fault at the last KV
                     # tile (no allocation slack). Wrap into the valid in-tile row
                     # range; the value is discarded by the guarded LDS store.
-                    safe_row = load_row_in_batch % fx.Index(BLOCK_N)
+                    safe_row = load_row_in_batch % fx.Int64(BLOCK_N)
                     row_idx = tile_start + safe_row + row_offset
                 else:
                     row_idx = tile_start + load_row_in_batch + row_offset
@@ -384,7 +396,7 @@ def build_flash_attn_func_module(
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = load_row_in_batch < fx.Int64(BLOCK_N)
                     if row_valid:
                         lds_row = load_row_in_batch + row_offset
                         _v_store_row_major(v_base, lds_row, vecs[batch])
@@ -396,18 +408,16 @@ def build_flash_attn_func_module(
         q_row = q_start + wave_q_offset + lane16
         q_row_i32 = fx.Int32(q_row)
         # Use explicit signed-less-than predicate to match baseline ISA
-        # (`v_cmp_gt_i64_e64`). fx.Index defaults to unsigned which would lower
-        # to `v_cmp_gt_u64_e64` and cause an ISA hash drift even though both
-        # variants are semantically equivalent for non-negative offsets.
+        # (`v_cmp_gt_i64_e64`) and preserve the baseline ISA hash.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
-        q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
+        q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Int64(0)))
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
-            q_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
+            q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
             raw = load_global_v8f16(q_ptr, g_idx)
-            q_b_packs.append(ArithValue(q_in_bounds).select(raw, c_zero_v8f16))
+            q_b_packs.append(q_in_bounds.select(raw, c_zero_v8f16))
 
         # ---- Constants ----
         c_neg_inf = fx.Float32(float("-inf"))
@@ -423,14 +433,12 @@ def build_flash_attn_func_module(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(
-                ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
-            )
+            kv_upper = (_q_end < seq_len_v).select(_q_end, seq_len_v)
         else:
             kv_upper = seq_len_real_v
 
         # ---- Opt4: Pre-issue first V global load before loop ----
-        _v_vecs_init = coop_load_v_global(fx.Index(0))
+        _v_vecs_init = coop_load_v_global(fx.Int64(0))
 
         init_args = [_raw(c_neg_inf), _raw(c_zero_f)]
         for _ in range_constexpr(D_CHUNKS):
@@ -441,8 +449,9 @@ def build_flash_attn_func_module(
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(
-            0, kv_upper, BLOCK_N_OUT, init=init_args
+            fx.Int64(0), kv_upper, fx.Int64(BLOCK_N_OUT), init=init_args
         ):
+            kv_block_start = fx.Int64(kv_block_start)
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
@@ -459,22 +468,18 @@ def build_flash_attn_func_module(
             s_accs = [_raw(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
 
             for ks in range_constexpr(K_STEPS_QK):
-                k_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
+                k_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
 
                 for st_idx in range_constexpr(N_SUB_TILES):
                     st_base_row = st_idx * K_SUB_N
 
-                    k_row_a = lane16 + fx.Index(st_base_row)
+                    k_row_a = lane16 + fx.Int64(st_base_row)
                     k_lds_a = k_base + k_row_a * K_STRIDE + k_col
-                    k_pack_a = fx.ptr_load(
-                        lds_kv + fx.Int32(k_lds_a), result_type=v8f16_type
-                    )
+                    k_pack_a = Vec.load(v8f16_type, lds_kv, [fx.Index(k_lds_a)])
 
-                    k_row_b = lane16 + fx.Index(st_base_row + 16)
+                    k_row_b = lane16 + fx.Int64(st_base_row + 16)
                     k_lds_b = k_base + k_row_b * K_STRIDE + k_col
-                    k_pack_b = fx.ptr_load(
-                        lds_kv + fx.Int32(k_lds_b), result_type=v8f16_type
-                    )
+                    k_pack_b = Vec.load(v8f16_type, lds_kv, [fx.Index(k_lds_b)])
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
@@ -510,9 +515,9 @@ def build_flash_attn_func_module(
                         idx = acc * 8 + r
                         col_i32 = kv_start_i32 + fx.Int32(acc * 16 + r) + klane_off_i32
                         if const_expr(CAUSAL):
-                            pred = ArithValue(col_i32 > q_row_i32)
+                            pred = col_i32 > q_row_i32
                         else:
-                            pred = ArithValue(col_i32 >= seq_len_real)
+                            pred = col_i32 >= seq_len_real
                         masked.append(pred.select(c_neg_inf, s_raw[idx]))
                 s_raw = masked
 
@@ -577,16 +582,16 @@ def build_flash_attn_func_module(
             v_base = v_buf_base(0)
 
             def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val, v_base=v_base):
-                d_pos = fx.Index(dc_val * D_CHUNK) + lane16
+                d_pos = fx.Int64(dc_val * D_CHUNK) + lane16
                 v_elems = []
                 for k_sub in range_constexpr(8):
                     kv_row = (
-                        fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
+                        fx.Int64(st_kv_base_val + pks_val * PV_K_STEP)
                         + klane * WMMA_LANE_K
-                        + fx.Index(k_sub)
+                        + fx.Int64(k_sub)
                     )
                     v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
-                    v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
+                    v_elems.append(_memref.load(lds_kv, [_raw(fx.Index(v_lds_idx))]))
                 return Vec.from_elements(v_elems, elem_dtype).ir_value()
 
             # Software pipeline: preload first V pack
@@ -623,7 +628,7 @@ def build_flash_attn_func_module(
             l_running = l_new
 
             # ---- Opt4: Issue NEXT iteration's V global load ----
-            next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
+            next_kv_start = kv_block_start + fx.Int64(BLOCK_N_OUT)
             _v_vecs_next = coop_load_v_global(next_kv_start)
 
             _yield_args = [m_running, l_running] + o_accs
@@ -642,7 +647,7 @@ def build_flash_attn_func_module(
             for dc in range_constexpr(D_CHUNKS):
                 o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
                 o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
-                d_col = fx.Index(dc * D_CHUNK) + klane * 8
+                d_col = fx.Int64(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)
 
@@ -660,10 +665,13 @@ def build_flash_attn_func_module(
             None
         ),
     ):
+        allocator.finalized = False
         ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
 
-        bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seq_len)
+        bs_idx = fx.Int64(batch_size)
+        sl_idx = fx.Int64(seq_len)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
