@@ -612,6 +612,16 @@ def test_flydsl_fp8_quant_rejects_unknown_backend():
         flydsl_fp8_quant(q, k, v, backend=None)
 
 
+def test_flydsl_arch_detection_does_not_require_rocminfo(monkeypatch):
+    from aiter.ops.flydsl import fmha_kernels
+
+    def _broken_rocminfo():
+        raise RuntimeError("rocminfo unavailable")
+
+    monkeypatch.setattr(fmha_kernels, "get_gfx_runtime", _broken_rocminfo)
+    assert fmha_kernels._live_gfx(torch.device("cuda:0")) == "gfx1201"
+
+
 def test_flydsl_fp8_quant_validates_input_contract():
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="share head_dim"):

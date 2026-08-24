@@ -177,14 +177,20 @@ if _HAS_TRITON:
         tl.store(yp + offs, x.to(yp.dtype.element_ty), mask=rmask[:, None])
 
 
-def _live_gfx() -> str:
-    """Arch of the live GPU (e.g. ``"gfx1201"``), or ``""`` when it cannot be
-    determined.
+def _live_gfx(device=None) -> str:
+    """Return the normalized architecture of a live GPU, or ``""``.
 
-    Non-raising wrapper over the shared runtime detector, which is the arch
-    source for runtime dispatch (``get_gfx()`` honours ``GPU_ARCHS`` and so
-    describes the build target, not the GPU actually executing).
+    Prefer PyTorch properties so detection follows the tensor's device and does
+    not require ``rocminfo`` in minimal runtime containers. Keep the shared
+    runtime detector as a fallback for environments without ``gcnArchName``.
     """
+    try:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "")
+        if arch:
+            return arch.lower().split(":")[0]
+    except Exception:  # noqa: BLE001
+        pass
     try:
         return get_gfx_runtime()
     except Exception:  # noqa: BLE001
@@ -268,7 +274,7 @@ def flydsl_fp8_quant(
     flydsl_supported = (
         q.dtype == k.dtype == v.dtype == torch.bfloat16
         and head_dim == 128
-        and _live_gfx() == "gfx1201"
+        and _live_gfx(q.device) == "gfx1201"
     )
     if be == "flydsl" and flydsl_supported:
         q8, sq = _quant_pertensor_flydsl(q, rotate=rotation)
@@ -467,7 +473,7 @@ def flydsl_flash_attn_func(
             "q/k/v must reside on the same device, got "
             f"q={q.device} k={k.device} v={v.device}"
         )
-    gfx = _live_gfx()
+    gfx = _live_gfx(q.device)
     if gfx != "gfx1201":
         raise ValueError(
             f"flydsl_flash_attn_func requires gfx1201, got {gfx or 'unknown'!r}"
