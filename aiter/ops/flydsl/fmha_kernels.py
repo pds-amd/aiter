@@ -187,10 +187,10 @@ def _live_gfx(device=None) -> str:
     try:
         props = torch.cuda.get_device_properties(device)
         arch = getattr(props, "gcnArchName", "")
-        if arch:
-            return arch.lower().split(":")[0]
     except Exception:  # noqa: BLE001
-        pass
+        arch = ""
+    if arch:
+        return arch.lower().split(":")[0]
     try:
         return get_gfx_runtime()
     except Exception:  # noqa: BLE001
