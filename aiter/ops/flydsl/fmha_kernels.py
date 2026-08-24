@@ -229,14 +229,37 @@ def flydsl_fp8_quant(
     e.g. cross-attention); it silently falls back to Triton/torch otherwise. The
     Triton fused path additionally requires same-size q/k/v.
     """
-    head_dim = q.shape[-1]
-    same_size = q.numel() == k.numel() == v.numel()
+    if not isinstance(backend, str):
+        raise TypeError(f"backend must be a string, got {type(backend).__name__}")
     be = backend.lower()
     if be not in {"flydsl", "triton", "torch"}:
         raise ValueError(
             f"unsupported fp8 quant backend {backend!r}; "
             "expected one of: 'flydsl', 'triton', 'torch'"
         )
+    if not all(torch.is_tensor(x) for x in (q, k, v)):
+        raise TypeError("q/k/v must be torch tensors")
+    if any(x.dim() == 0 for x in (q, k, v)):
+        raise ValueError("q/k/v must have at least one dimension")
+    if not (q.shape[-1] == k.shape[-1] == v.shape[-1]):
+        raise ValueError(
+            "q/k/v must share head_dim, got "
+            f"q={q.shape[-1]} k={k.shape[-1]} v={v.shape[-1]}"
+        )
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"q/k/v must be bfloat16 or float16, got {q.dtype}")
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q/k/v must be CUDA/HIP tensors")
+    if not (q.device == k.device == v.device):
+        raise ValueError(
+            "q/k/v must reside on the same device, got "
+            f"q={q.device} k={k.device} v={v.device}"
+        )
+
+    head_dim = q.shape[-1]
+    same_size = q.numel() == k.numel() == v.numel()
 
     # Fully-FlyDSL per-tensor path (no Triton). Each tensor is quantized by its
     # own independent launch, so q/k/v need not be the same size (cross-attention

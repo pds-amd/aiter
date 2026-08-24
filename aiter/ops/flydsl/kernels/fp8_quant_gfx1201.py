@@ -217,36 +217,55 @@ def flydsl_fp8_pertensor_quant(
     FlyDSL. ``x`` last dim is ``head_dim`` (flattened to [M, D]).
 
     Returns ``(x_fp8, scale)`` where ``scale`` is a 1-element f32 tensor
-    (``real = fp8 * scale``). head_dim==128 only; callers fall back otherwise.
+    (``real = fp8 * scale``). This low-level entry point requires head_dim=128.
     """
     if x.dtype != torch.bfloat16:
         raise TypeError(
             "flydsl_fp8_pertensor_quant requires bfloat16 input, " f"got {x.dtype}"
         )
+    if not x.is_cuda:
+        raise ValueError("flydsl_fp8_pertensor_quant requires a GPU tensor")
+    if x.dim() == 0 or x.shape[-1] != 128:
+        got = None if x.dim() == 0 else x.shape[-1]
+        raise ValueError(f"flydsl_fp8_pertensor_quant requires head_dim=128, got {got}")
+    if x.numel() == 0:
+        raise ValueError("flydsl_fp8_pertensor_quant requires a non-empty tensor")
 
     D = x.shape[-1]
-    x = x.contiguous()
-    M = x.numel() // D
-    if out is None:
-        out = torch.empty_like(x, dtype=_FP8_DTYPE)
-    partials = torch.empty(M, dtype=torch.float32, device=x.device)
-
     if stream is None:
-        stream = torch.cuda.current_stream()
-    fx_stream = Stream(stream)
+        stream = torch.cuda.current_stream(x.device)
+    if stream.device != x.device:
+        raise ValueError(f"stream must be on {x.device}, got {stream.device}")
+
+    expected_shape = tuple(x.shape)
+    if out is not None and (
+        tuple(out.shape) != expected_shape
+        or out.dtype != _FP8_DTYPE
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be a contiguous float8_e4m3fn tensor with shape "
+            f"{expected_shape} on {x.device}"
+        )
 
     def _ptr(t):
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    # pass 1: per-row amax partials (x_out unused -> pass x_in as a valid ptr).
-    amax_k = _compile(head_dim=D, rotate=rotate, mode="amax")
-    _run_compiled(amax_k, _ptr(x), _ptr(x), _ptr(partials), M, fx_stream)
-    # Keep the intermediate reduction ordered after pass 1 and before pass 2
-    # when the caller supplies a stream other than PyTorch's current stream.
-    with torch.cuda.stream(stream):
+    with torch.cuda.device(x.device), torch.cuda.stream(stream):
+        x = x.contiguous()
+        M = x.numel() // D
+        if out is None:
+            out = torch.empty_like(x, dtype=_FP8_DTYPE)
+        partials = torch.empty(M, dtype=torch.float32, device=x.device)
+        fx_stream = Stream(stream)
+
+        # Pass 1 writes per-row amax partials; x_out is unused.
+        amax_k = _compile(head_dim=D, rotate=rotate, mode="amax")
+        _run_compiled(amax_k, _ptr(x), _ptr(x), _ptr(partials), M, fx_stream)
         scale = (partials.amax() / _FP8_MAX).clamp(min=1e-12).reshape(1)
 
-    # pass 2: scale/clamp/cast to fp8 using the single global descale.
-    scale_k = _compile(head_dim=D, rotate=rotate, mode="scale")
-    _run_compiled(scale_k, _ptr(x), _ptr(out), _ptr(scale), M, fx_stream)
+        # Pass 2 scales, clamps, and casts using the global descale.
+        scale_k = _compile(head_dim=D, rotate=rotate, mode="scale")
+        _run_compiled(scale_k, _ptr(x), _ptr(out), _ptr(scale), M, fx_stream)
     return out, scale

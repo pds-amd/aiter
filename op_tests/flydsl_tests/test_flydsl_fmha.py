@@ -607,6 +607,18 @@ def test_flydsl_fp8_quant_rejects_unknown_backend():
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="unsupported fp8 quant backend"):
         flydsl_fp8_quant(q, k, v, backend="flydls")
+    with pytest.raises(TypeError, match="backend must be a string"):
+        flydsl_fp8_quant(q, k, v, backend=None)
+
+
+def test_flydsl_fp8_quant_validates_input_contract():
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    with pytest.raises(ValueError, match="share head_dim"):
+        flydsl_fp8_quant(q, k[..., :64], v)
+    with pytest.raises(ValueError, match="dtype must match"):
+        flydsl_fp8_quant(q, k.to(torch.float16), v)
+    with pytest.raises(ValueError, match="CUDA/HIP tensors"):
+        flydsl_fp8_quant(q.cpu(), k.cpu(), v.cpu())
 
 
 def test_flydsl_fp8_quant_non_current_stream():
@@ -621,6 +633,26 @@ def test_flydsl_fp8_quant_non_current_stream():
 
     cos = F.cosine_similarity(x.float(), xq.float() * scale, dim=1)
     assert cos.mean().item() > 0.99
+
+
+def test_flydsl_fp8_quant_validates_low_level_contract():
+    from aiter.ops.flydsl.kernels.fp8_quant_gfx1201 import (
+        flydsl_fp8_pertensor_quant,
+    )
+
+    x = torch.randn(1024, 128, dtype=torch.bfloat16, device="cuda")
+    bad_outputs = (
+        torch.empty(1024, 64, dtype=torch.float8_e4m3fn, device="cuda"),
+        torch.empty_like(x),
+        torch.empty(128, 1024, dtype=torch.float8_e4m3fn, device="cuda").T,
+        torch.empty(1024, 128, dtype=torch.float8_e4m3fn, device="cpu"),
+    )
+    for out in bad_outputs:
+        with pytest.raises(ValueError, match="out must be a contiguous"):
+            flydsl_fp8_pertensor_quant(x, rotate=False, out=out)
+
+    with pytest.raises(ValueError, match="head_dim=128"):
+        flydsl_fp8_pertensor_quant(x[:, :64], rotate=False)
 
 
 def test_flydsl_fp8_ignores_bf16_lds_vec_width_toggle(monkeypatch):
