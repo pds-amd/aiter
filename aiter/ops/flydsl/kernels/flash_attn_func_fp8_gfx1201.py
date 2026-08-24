@@ -189,10 +189,9 @@ def build_flash_attn_func_module(
         f"_h{num_heads}_d{head_dim}_m{BLOCK_M}n{BLOCK_N}{_name_flags}"
     )
 
-    # LDS layout -- K uses padding instead of XOR swizzle; V row-major with padding
+    # LDS layout -- K is row-major; V is transposed with the KV row contiguous.
     K_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts (no swizzle)
     K_STRIDE_I32 = K_STRIDE // 4  # K in i32 units (4 fp8 per i32)
-    V_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts
 
     # The FP8 packing and transposed LDS layout require one 16-byte vector per
     # lane. The BF16 kernel's vec8 diagnostic toggle does not apply here.
@@ -208,14 +207,14 @@ def build_flash_attn_func_module(
         KV_NEEDS_GUARD = False
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
-    LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
-    LDS_V_BASE = LDS_K_TOTAL_SIZE // 2  # V right after fp8 K (bf16 elem units)
-    LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
-    # fp8 V stored transposed in LDS (V_T[d][kv_row]) so GEMM2 reads contiguous v2i32.
+    # FP8 V is transposed in LDS (V_T[d][kv_row]) so GEMM2 reads contiguous
+    # v2i32. All V sizing and addressing is expressed directly in bytes.
     KV_STRIDE_FP8 = BLOCK_N + 4  # fp8 bytes per d-row (kv_row inner + pad)
     KV_STRIDE_I32_FP8 = KV_STRIDE_FP8 // 4  # i32 words per d-row (contiguous kv load)
     V_BYTE_BASE = LDS_K_TOTAL_SIZE  # fp8 V region starts after fp8 K region (bytes)
+    LDS_V_TOTAL_BYTES = NUM_PREFETCH_V * HEAD_DIM * KV_STRIDE_FP8
+    LDS_TOTAL_BYTES = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_BYTES
 
     # PERF(gfx1201): Keep typed SmemPtr views and their required fx.Index
     # boundaries. FlyDSL 0.2.4 and 0.3.1 SharedAllocator byte-pointer lowering
@@ -227,8 +226,8 @@ def build_flash_attn_func_module(
         global_sym_name=f"flash_attn_func_fp8_gfx1201c_exp_a_smem_{PATH_TAG}",
     )
     lds_kv_offset = allocator._align(allocator.ptr, 16)
-    # FP8 K (1 byte/elem) then V, V placed right after the fp8 K region.
-    allocator.ptr = lds_kv_offset + LDS_K_TOTAL_SIZE * 1 + LDS_V_TOTAL_SIZE * 2
+    # FP8 K (1 byte/elem) followed by the transposed FP8 V region.
+    allocator.ptr = lds_kv_offset + LDS_TOTAL_BYTES
 
     # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and `.to(...)`).
     # aiter's `dtype_to_elem_type` returns a raw MLIR `ir.Type`; the FlyDSL Vector
@@ -333,18 +332,17 @@ def build_flash_attn_func_module(
         # fp8 V region views (same base_ptr/offset as lds_kv):
         # i8 view → byte-addressable GEMM2 read; i32 view → vectorized convert-store.
         _i8_mlir_type = ir.IntegerType.get_signless(8)
-        _lds_total_bytes = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE * 2
         lds_v_i8 = SmemPtr(
             base_ptr,
             lds_kv_offset,
             _i8_mlir_type,
-            shape=(_lds_total_bytes,),
+            shape=(LDS_TOTAL_BYTES,),
         ).get()
         lds_v_i32 = SmemPtr(
             base_ptr,
             lds_kv_offset,
             _i32_mlir_type,
-            shape=(_lds_total_bytes // 4,),
+            shape=(LDS_TOTAL_BYTES // 4,),
         ).get()
 
         block_id = fx.Index(gpu.block_idx.x)
@@ -427,9 +425,6 @@ def build_flash_attn_func_module(
             if const_expr(isinstance(buf_id, int)):
                 return fx.Index(buf_id * LDS_K_TILE_SIZE)
             return buf_id * fx.Index(LDS_K_TILE_SIZE)
-
-        def v_buf_base(buf_id):
-            return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
 
         def _vec16f16_to_4xi32_fp8(vec):
             # Convert v16f16/v16bf16 → 16 fp8 packed as 4 i32 (4 fp8/i32).
