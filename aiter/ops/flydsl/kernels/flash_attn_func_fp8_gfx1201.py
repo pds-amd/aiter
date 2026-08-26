@@ -67,14 +67,17 @@ except ImportError:
     from aiter.ops.flydsl.kernels import buffer_ops
 
 from .flash_attn_func_common_gfx1201 import (
+    configure_gpu_module,
     fast_mul as _fmul,
     flatten_and_mask_scores,
     kv_load_schedule,
     next_kv_tile_start,
+    pointer_arg,
     pointer_load as _pointer_load,
     pointer_store as _pointer_store,
     pointer_to_llvm_ptr as _pointer_to_llvm_ptr,
     update_online_softmax,
+    wrap_pointer_args,
 )
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled
@@ -687,51 +690,7 @@ def build_flash_attn_func_module(
             v_scale_ptr,
         )
 
-        if const_expr(waves_per_eu is not None):
-            _wpe = int(waves_per_eu)
-            if const_expr(_wpe >= 1):
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            T.i32, _wpe
-                        )
-        if const_expr(flat_work_group_size is not None):
-            _fwgs = int(flat_work_group_size)
-            if const_expr(_fwgs >= 1):
-                flat_wg_attr = ir.StringAttr.get(f"{_fwgs},{_fwgs}")
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
-
-        passthrough_entries = []
-        if const_expr(daz):
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("denormal-fp-math-f32"),
-                        ir.StringAttr.get("preserve-sign,preserve-sign"),
-                    ]
-                )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("no-nans-fp-math"),
-                        ir.StringAttr.get("true"),
-                    ]
-                )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("unsafe-fp-math"),
-                        ir.StringAttr.get("true"),
-                    ]
-                )
-            )
-        for op in ctx.gpu_module_body.operations:
-            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
+        configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz)
 
         launcher.launch(grid=(grid_x, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
@@ -741,34 +700,15 @@ def build_flash_attn_func_module(
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    def _ptr_arg(t):
-        if hasattr(t, "data_ptr"):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            ptr = (
-                0
-                if type_name == "FakeTensor" or "fake_tensor" in module_name
-                else t.data_ptr()
-            )
-            return flyc.from_c_void_p(fx.Uint8, ptr)
-        return t
-
-    def _wrap_qkvo(args, kwargs):
-        args = list(args)
-        for idx in range(min(4, len(args))):
-            args[idx] = _ptr_arg(args[idx])
-        # positional: Q,K,V,O,batch,seq_len,seq_len_real,seq_len_kv,q_scale,k_scale,v_scale
-        for idx in range(8, min(11, len(args))):
-            args[idx] = _ptr_arg(args[idx])
-        for name in ("Q", "K", "V", "O", "q_scale_ptr", "k_scale_ptr", "v_scale_ptr"):
-            if name in kwargs:
-                kwargs[name] = _ptr_arg(kwargs[name])
-        return tuple(args), kwargs
-
     launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(*args, **kwargs):
-        args, kwargs = _wrap_qkvo(args, kwargs)
+        args, kwargs = wrap_pointer_args(
+            args,
+            kwargs,
+            (0, 1, 2, 3, 8, 9, 10),
+            ("Q", "K", "V", "O", "q_scale_ptr", "k_scale_ptr", "v_scale_ptr"),
+        )
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
@@ -789,17 +729,17 @@ def build_flash_attn_func_module(
         # scales are device f32 pointers (1-element tensors), not host floats.
         return flyc.compile(
             launch_flash_attn_func,
-            _ptr_arg(Q),
-            _ptr_arg(K),
-            _ptr_arg(V),
-            _ptr_arg(O),
+            pointer_arg(Q),
+            pointer_arg(K),
+            pointer_arg(V),
+            pointer_arg(O),
             batch_size,
             seq_len,
             seq_len_real,
             seq_len_kv,
-            _ptr_arg(q_scale),
-            _ptr_arg(k_scale),
-            _ptr_arg(v_scale),
+            pointer_arg(q_scale),
+            pointer_arg(k_scale),
+            pointer_arg(v_scale),
             fx.Stream(stream),
         )
 

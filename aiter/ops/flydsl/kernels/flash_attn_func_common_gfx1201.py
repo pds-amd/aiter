@@ -3,12 +3,14 @@
 
 """Shared representation-independent helpers for gfx1201 flash attention."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
+from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 
@@ -138,3 +140,62 @@ def next_kv_tile_start(kv_block_start, kv_upper, block_n, zero):
     """Return the next tile start, wrapping the final speculative load to zero."""
     next_start = kv_block_start + block_n
     return (next_start < kv_upper).select(next_start, zero)
+
+
+def configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz):
+    """Apply launch attributes shared by both attention kernels."""
+    if const_expr(waves_per_eu is not None):
+        value = int(waves_per_eu)
+        if const_expr(value >= 1):
+            for op in ctx.gpu_module_body.operations:
+                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        T.i32, value
+                    )
+    if const_expr(flat_work_group_size is not None):
+        value = int(flat_work_group_size)
+        if const_expr(value >= 1):
+            flat_wg_attr = ir.StringAttr.get(f"{value},{value}")
+            for op in ctx.gpu_module_body.operations:
+                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                    op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
+
+    passthrough_entries = []
+    if const_expr(daz):
+        for name, value in (
+            ("denormal-fp-math-f32", "preserve-sign,preserve-sign"),
+            ("no-nans-fp-math", "true"),
+            ("unsafe-fp-math", "true"),
+        ):
+            passthrough_entries.append(
+                ir.ArrayAttr.get([ir.StringAttr.get(name), ir.StringAttr.get(value)])
+            )
+    for op in ctx.gpu_module_body.operations:
+        if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+            op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
+
+
+def pointer_arg(value):
+    """Convert tensor-like launch arguments to raw FlyDSL pointers."""
+    if not hasattr(value, "data_ptr"):
+        return value
+    type_name = type(value).__name__
+    module_name = type(value).__module__
+    ptr = (
+        0
+        if type_name == "FakeTensor" or "fake_tensor" in module_name
+        else value.data_ptr()
+    )
+    return flyc.from_c_void_p(fx.Uint8, ptr)
+
+
+def wrap_pointer_args(args, kwargs, positional_indices, keyword_names):
+    """Convert selected positional and keyword launch arguments to pointers."""
+    args = list(args)
+    for idx in positional_indices:
+        if idx < len(args):
+            args[idx] = pointer_arg(args[idx])
+    for name in keyword_names:
+        if name in kwargs:
+            kwargs[name] = pointer_arg(kwargs[name])
+    return tuple(args), kwargs
