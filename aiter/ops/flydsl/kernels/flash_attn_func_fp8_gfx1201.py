@@ -66,7 +66,7 @@ try:
 except ImportError:
     from aiter.ops.flydsl.kernels import buffer_ops
 
-from .flash_attn_gfx1201_common import (
+from .flash_attn_func_common_gfx1201 import (
     fast_mul as _fmul,
     flatten_and_mask_scores,
     kv_load_schedule,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Representation-independent helpers for gfx1201 flash attention kernels."""
+"""Shared representation-independent helpers for gfx1201 flash attention."""
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
