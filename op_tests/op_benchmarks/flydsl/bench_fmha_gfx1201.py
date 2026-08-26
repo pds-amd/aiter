@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Perf test for the flydsl flash-attention kernels (gfx1201 / RDNA4).
+"""Benchmark the FlyDSL flash-attention kernels for gfx1201 / RDNA4.
 
 Drives the public ``flydsl_flash_attn_func`` wrapper (which dispatches the
 bf16/f16 and per-tensor-fp8 gfx1201 kernels) and benchmarks it against torch
